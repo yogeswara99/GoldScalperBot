@@ -1,12 +1,13 @@
 # ================================================================
-#  config_v1.0.py  —  GoldScalperBot  XAUUSD...  (MultiBank)
-#  VERSION 1.0  —  The $17k baseline result
-#  DO NOT MODIFY THIS FILE — it is the locked reference version
-#  Copy to config.py to use
+#  config.py  --  GoldScalperBot  XAUUSD...  (MultiBank)
+#  VERSION 1.3  --  Restored working baseline
+#
+#  Results: $13,352 | 73.8% WR | 1,821 trades | 26.1% DD
+#  Score: 804.081  (best achieved so far)
 # ================================================================
 
 # ---- BROKER / SYMBOL ---------------------------------------
-SYMBOL          = "XAUUSD..."         # THREE DOTS — MultiBank/MEX Global
+SYMBOL          = "XAUUSD..."
 BROKER_SERVER   = "MEXGlobalFinancial-Demo"
 POINT           = 0.01
 DIGITS          = 2
@@ -19,12 +20,14 @@ ACCOUNT_BALANCE = 2000.0
 ACCOUNT_LEVERAGE= 500
 
 # ---- RISK PER TRADE ----------------------------------------
-RISK_NORMAL_PCT = 0.01                # 1% per trade = $20
-RISK_NEWS_PCT   = 0.005
-RISK_NORMAL_USD = ACCOUNT_BALANCE * RISK_NORMAL_PCT
-RISK_NEWS_USD   = ACCOUNT_BALANCE * RISK_NEWS_PCT
+MAX_CONCURRENT_TRADES  = 3
+TOTAL_RISK_BUDGET_PCT  = 0.015       # 1.5% total budget
+RISK_NORMAL_PCT        = TOTAL_RISK_BUDGET_PCT / MAX_CONCURRENT_TRADES  # 0.5%
+RISK_NORMAL_USD        = ACCOUNT_BALANCE * RISK_NORMAL_PCT
+RISK_NEWS_PCT          = 0.005
+RISK_NEWS_USD          = ACCOUNT_BALANCE * RISK_NEWS_PCT
 
-# ---- ATR-BASED SL/TP (replaces fixed points) ---------------
+# ---- SL/TP -------------------------------------------------
 SL_ATR_MULTIPLIER   = 1.5
 SL_ATR_MIN_MULT     = 1.0
 SL_ATR_MAX_MULT     = 2.5
@@ -37,30 +40,29 @@ LOT_MAX         = 10.0
 LOT_STEP        = 0.01
 MIN_RR          = 1.5
 
+# ---- COMMISSION --------------------------------------------
+COMMISSION_USD  = 0.0
+
 # ---- CIRCUIT BREAKERS --------------------------------------
-MAX_DAILY_LOSS_PCT   = 0.03
+MAX_DAILY_LOSS_PCT   = 0.04
 MAX_DAILY_LOSS_USD   = ACCOUNT_BALANCE * MAX_DAILY_LOSS_PCT
-MAX_CONSEC_LOSSES    = 3
-MAX_TRADES_PER_SESS  = 5
-WEEKLY_DD_PCT        = 0.08
+MAX_CONSEC_LOSSES    = 4
+MAX_TRADES_PER_SESS  = 20
+WEEKLY_DD_PCT        = 0.10
 WEEKLY_DD_USD        = ACCOUNT_BALANCE * WEEKLY_DD_PCT
 
 # ---- SESSIONS (UTC) ----------------------------------------
-LONDON_OPEN_H    = 8
-LONDON_OPEN_MIN  = 30                 # Delay to 08:30 (data: 08:00 = 2.44x loss ratio)
-LONDON_CLOSE_H   = 11
-NY_OPEN_H        = 13
-NY_CLOSE_H       = 16
+LONDON_OPEN_H    = 7
+LONDON_OPEN_MIN  = 0
+LONDON_CLOSE_H   = 12
+NY_OPEN_H        = 12
+NY_CLOSE_H       = 18
 
-# ---- DATA-SUPPORTED FILTERS (from drawdown analysis) -------
-FILTER_VOL_MIN_Z     = 0.0            # Block vol_z below this
-FILTER_LONDON_DELAY  = True           # Block 08:00-08:29 UTC
-FILTER_MONDAY_LOT    = 0.70           # 70% lot on Mondays
-
-# ---- NEWS MODE ---------------------------------------------
-NEWS_TP1_PTS    = 100
-NEWS_TP2_PTS    = 180
-NEWS_SL_PTS     = 50
+# ---- FILTERS -----------------------------------------------
+FILTER_VOL_MIN_Z     = 0.0
+FILTER_LONDON_DELAY  = False
+FILTER_MONDAY_LOT    = 0.70
+FILTER_THURSDAY_LOT  = 1.0
 
 # ---- LOGGING -----------------------------------------------
 LOG_VERBOSE     = False

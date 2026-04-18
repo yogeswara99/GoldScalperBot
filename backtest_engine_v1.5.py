@@ -1,10 +1,43 @@
 # ================================================================
-#  backtest_engine.py  --  GoldScalperBot  XAUUSD...
-#  VERSION 1.3  --  Restored working baseline
+#  backtest_engine_v1.5.py  --  GoldScalperBot  XAUUSD...
+#  VERSION 1.5  --  ML-Optimized signal engine
 #
-#  Results: $13,352 | 73.8% WR | 1,821 trades | 26.1% DD
-#  Score: 804.081
-#  ~2.4 trades/day across London 07:00-12:00 + NY 12:00-18:00 UTC
+#  Signal completely rebuilt from Random Forest permutation importance:
+#
+#  ESSENTIAL FEATURES (top 80% importance) now drive ALL entry logic:
+#    1. h1_ema_slope3   17.03%  -- H1 EMA 3-bar slope (NEW primary)
+#    2. price_mom_3bar   8.67%  -- 3-bar price momentum
+#    3. h1_ema_slope5    8.67%  -- H1 EMA 5-bar slope (confirmation)
+#    4. vol_vs_mean20    8.67%  -- volume vs 20-bar mean
+#    5. price_mom_10bar  8.05%  -- 10-bar price momentum
+#    6. atr_pts          7.74%  -- absolute ATR size
+#    7. close_pos        5.57%  -- candle close position
+#    8. bb_width         5.26%  -- Bollinger band width
+#    9. is_london        4.95%  -- London session flag
+#   10. atr_5bar_roc     4.02%  -- ATR rate of change
+#
+#  ACTIVELY HARMFUL features REMOVED:
+#    - H4 5-bar slope  (-0.023)  WAS our core trend filter
+#    - H1 price vs EMA (-0.013)
+#    - bb_pct_b        (-0.011)
+#    - RSI 5-bar slope (-0.011)
+#    - H4 vs EMA20     (-0.010)
+#    - StochRSI K      (-0.008)
+#    - ATR ratio       (-0.006)
+#    - body_ratio      (-0.005)
+#    - ADX             (-0.003)
+#    - NY session      (-0.0003)
+#
+#  Optuna results (200 trials):
+#    be_trigger=7.42 | max_consec=7 | sl_atr=2.39 | tp_rr=2.76
+#    risk=0.51% | max_concurrent=1 | London 09:00-14:00 UTC only
+#
+#  v1.3 baseline: $13,352 | 73.8% WR | 1,821 trades | 26.1% DD
+#  Optuna target: $1,852  | 80.6% WR |   475 trades |  2.8% DD
+#  Goal of v1.5:  Higher profit by applying ML signal to full data
+#                 while keeping the optimal parameter set
+#
+#  DO NOT MODIFY -- locked reference for v1.5
 # ================================================================
 
 import MetaTrader5 as mt5
@@ -113,21 +146,14 @@ class Indicators:
         m = vol.rolling(period).mean()
         s = vol.rolling(period).std()
         return (vol-m)/s.replace(0, np.nan)
-
-class ScoringEngine:
-    def __init__(self, weights=None):
-        self.weights = weights or {
-            "elliott_bias":  0.20, "smc_structure": 0.25,
-            "fvg_confluence":0.15, "h1_momentum":   0.15,
-            "m15_bos":       0.15, "volume_confirm": 0.10,
-        }
-    def calculate(self, conditions):
-        ws = sum(w for k,w in self.weights.items() if conditions.get(k, False))
-        rc = sum(1 for k in self.weights if conditions.get(k, False))
-        grade = "A+" if ws>=0.85 else "B" if ws>=0.65 else "C" if ws>=0.45 else "SKIP"
-        return ws, rc, grade
-    def lot_multiplier(self, pw):
-        return 1.00 if pw>=0.85 else 0.75 if pw>=0.65 else 0.50 if pw>=0.45 else 0.00
+    @staticmethod
+    def bollinger(close, period=20, std_dev=2.0):
+        mid   = close.rolling(period).mean()
+        std   = close.rolling(period).std()
+        upper = mid + std_dev * std
+        lower = mid - std_dev * std
+        width = (upper - lower) / (mid.replace(0, np.nan))
+        return mid, upper, lower, width
 
 class TradeSimulator:
     def __init__(self, starting_balance=ACCOUNT_BALANCE):
@@ -146,16 +172,14 @@ class TradeSimulator:
 
     def reset(self, b=ACCOUNT_BALANCE): self.__init__(b)
 
-    def calc_lot_size(self, sl_pts, pw, scorer):
+    def calc_lot_size(self, sl_pts):
         risk = self.equity * RISK_NORMAL_PCT
         base = risk / (sl_pts * CONTRACT_SIZE * POINT)
-        raw  = base * scorer.lot_multiplier(pw)
-        lot  = round(raw / LOT_STEP) * LOT_STEP
+        lot  = round(base / LOT_STEP) * LOT_STEP
         return max(LOT_MIN, min(LOT_MAX, round(lot, 2)))
 
     def open_trade(self, direction, entry_price, sl_price, tp_price,
-                   lot_size, spread, signal_score, grade,
-                   prob_weight, open_time, params={}):
+                   lot_size, spread, open_time):
         self.trade_counter += 1
         sp = spread * POINT
         if direction == "LONG":
@@ -170,9 +194,7 @@ class TradeSimulator:
             trade_id=self.trade_counter, direction=direction,
             open_time=open_time, close_time=None,
             entry_price=adj_e, sl_price=adj_sl, tp_price=adj_tp,
-            lot_size=lot_size, spread_at_entry=spread,
-            signal_score=signal_score, signal_grade=grade,
-            prob_weight=prob_weight, is_open=True)
+            lot_size=lot_size, spread_at_entry=spread, is_open=True)
         self.open_trades.append(t)
         self.session_trade_count += 1
         return t
@@ -182,7 +204,8 @@ class TradeSimulator:
         for t in self.open_trades:
             cp = None; reason = ""
             sp      = t.spread_at_entry * POINT
-            be_min  = sp * 3.5  # breakeven trigger: 3.5x spread
+            # v1.5: BE trigger from Optuna (7.4x spread)
+            be_min  = sp * BE_PROFIT_TRIGGER_MULT
 
             if t.direction == "LONG":
                 cur    = bar["Close"] - t.entry_price
@@ -197,8 +220,11 @@ class TradeSimulator:
                 elif cur > be_min and rsi_slope_val < -5 and bar["BodySize"] < bar["Range"]*0.3:
                     cp, reason = bar["Close"], "MOMENTUM"
                 elif cur > be_min and t.sl_price < t.entry_price:
-                    t.sl_price = t.entry_price + sp
-                    t.tp_price = bar["High"] + atr_val * TP_TRAIL_ATR_MULT
+                    # v1.5: BE lock = entry + 1.41x spread (Optuna be_lock)
+                    new_sl = t.entry_price + sp * BE_SL_LOCK_MULT
+                    if new_sl > t.sl_price:
+                        t.sl_price = new_sl
+                        t.tp_price = bar["High"] + atr_val * TP_TRAIL_ATR_MULT
             else:
                 cur    = t.entry_price - bar["Close"]
                 sl_hit = bar["High"] >= t.sl_price
@@ -212,8 +238,10 @@ class TradeSimulator:
                 elif cur > be_min and rsi_slope_val > 5 and bar["BodySize"] < bar["Range"]*0.3:
                     cp, reason = bar["Close"], "MOMENTUM"
                 elif cur > be_min and t.sl_price > t.entry_price:
-                    t.sl_price = t.entry_price - sp
-                    t.tp_price = bar["Low"] - atr_val * TP_TRAIL_ATR_MULT
+                    new_sl = t.entry_price - sp * BE_SL_LOCK_MULT
+                    if new_sl < t.sl_price:
+                        t.sl_price = new_sl
+                        t.tp_price = bar["Low"] - atr_val * TP_TRAIL_ATR_MULT
 
             if cp is not None:
                 to_close.append((t, cp, reason, bar_time))
@@ -300,7 +328,6 @@ class BacktestLogger:
 class BacktestRunner:
     def __init__(self):
         self.loader    = DataLoader(SYMBOL)
-        self.scorer    = ScoringEngine()
         self.simulator = TradeSimulator()
         self.logger    = BacktestLogger()
 
@@ -324,23 +351,39 @@ class BacktestRunner:
             return df.rename(columns=m)
         df_h4=_norm(df_h4); df_h1=_norm(df_h1); df_m15=_norm(df_m15)
 
-        # Pre-compute indicators
-        df_h4["ATR14"]      = Indicators.atr(df_h4["High"],df_h4["Low"],df_h4["Close"],14)
-        df_h1["RSI14"]      = Indicators.rsi(df_h1["Close"],14)
-        df_h1["EMA20"]      = Indicators.ema(df_h1["Close"],20)
-        df_h1["EMA20slope"] = df_h1["EMA20"].diff(3)
-        df_m15["RSI14"]     = Indicators.rsi(df_m15["Close"],14)
-        df_m15["RSIslope"]  = Indicators.rsi_slope(df_m15["RSI14"],3)
-        df_m15["ATR14"]     = Indicators.atr(df_m15["High"],df_m15["Low"],df_m15["Close"],14)
-        df_m15["VolZ"]      = Indicators.volume_zscore(df_m15["Volume"],20)
-        stk, std            = Indicators.stoch_rsi(df_m15["Close"])
-        df_m15["StochK"]    = stk
-        df_m15["StochD"]    = std
+        # ---- Pre-compute indicators --------------------------
+        # H1: EMA slopes (features #1 and #3 -- most important)
+        df_h1["EMA20"]        = Indicators.ema(df_h1["Close"], 20)
+        df_h1["EMA20slope3"]  = df_h1["EMA20"].diff(3)   # 3-bar slope (rank 1)
+        df_h1["EMA20slope5"]  = df_h1["EMA20"].diff(5)   # 5-bar slope (rank 3)
+        df_h1["RSI14"]        = Indicators.rsi(df_h1["Close"], 14)
+
+        # M15: price momentum, ATR, volume, Bollinger, RSI slope
+        df_m15["ATR14"]       = Indicators.atr(df_m15["High"],df_m15["Low"],df_m15["Close"],14)
+        df_m15["RSI14"]       = Indicators.rsi(df_m15["Close"], 14)
+        df_m15["RSIslope3"]   = df_m15["RSI14"].diff(3)   # 3-bar RSI slope (rank 15)
+        df_m15["RSIslope"]    = df_m15["RSI14"].diff(3)   # for momentum exit
+        df_m15["VolZ"]        = Indicators.volume_zscore(df_m15["Volume"], 20)
+        df_m15["VolMean20"]   = df_m15["Volume"].rolling(20).mean()
+        df_m15["VolVsMean20"] = (df_m15["Volume"] - df_m15["VolMean20"]) / (df_m15["VolMean20"] + 1e-9)
+
+        # Bollinger bands (rank 8: width is essential, pct_b is harmful)
+        _, bb_upper, bb_lower, bb_width = Indicators.bollinger(df_m15["Close"], 20, 2.0)
+        df_m15["BBWidth"]     = bb_width
+
+        # ATR 5-bar rate of change (rank 10: 4.02%)
+        df_m15["ATR5ROC"]     = df_m15["ATR14"].pct_change(5)
+
+        # StochRSI (for entry confirmation -- stoch_oversold rank 14)
+        stk, std              = Indicators.stoch_rsi(df_m15["Close"])
+        df_m15["StochK"]      = stk
+        df_m15["StochD"]      = std
 
         for i in range(50, len(df_m15)):
             bar_time = df_m15.index[i]
             bar      = df_m15.iloc[i]
 
+            # Daily / weekly resets
             bar_date = bar_time.date()
             if bar_date != daily_reset_date:
                 self.simulator.daily_loss     = 0.0
@@ -352,105 +395,183 @@ class BacktestRunner:
                 self.simulator.weekly_loss = 0.0
                 weekly_reset_key = week_key
 
-            hour      = bar_time.hour
-            in_london = (LONDON_OPEN_H <= hour < LONDON_CLOSE_H)
-            in_ny     = (NY_OPEN_H     <= hour < NY_CLOSE_H)
-            in_session= in_london or in_ny
+            hour = bar_time.hour
 
-            if in_london:   sess_key = f"london_{bar_date}"
-            elif in_ny:     sess_key = f"ny_{bar_date}"
-            else:           sess_key = None
+            # v1.5: London ONLY (NY removed -- harmful per ML)
+            in_london = (LONDON_OPEN_H <= hour < LONDON_CLOSE_H)
+            in_session = in_london
+
+            if in_london:
+                sess_key = f"london_{bar_date}"
+            else:
+                sess_key = None
 
             if sess_key and sess_key != self.simulator.current_session_key:
                 self.simulator.current_session_key = sess_key
                 self.simulator.session_trade_count = 0
 
-            atr_val = bar["ATR14"]    if not pd.isna(bar["ATR14"])    else 10.0
-            rsi_val = bar["RSI14"]    if not pd.isna(bar["RSI14"])    else 50.0
-            rsi_slp = bar["RSIslope"] if not pd.isna(bar["RSIslope"]) else 0.0
-            vol_z   = bar["VolZ"]     if not pd.isna(bar["VolZ"])     else 0.0
+            # Get bar values safely
+            atr_val    = bar["ATR14"]     if not pd.isna(bar["ATR14"])     else 10.0
+            rsi_slp    = bar["RSIslope"]  if not pd.isna(bar["RSIslope"])  else 0.0
+            rsi_slp3   = bar["RSIslope3"] if not pd.isna(bar["RSIslope3"]) else 0.0
+            vol_z      = bar["VolZ"]      if not pd.isna(bar["VolZ"])      else 0.0
+            vol_vs_mean= bar["VolVsMean20"] if not pd.isna(bar["VolVsMean20"]) else 0.0
+            bb_w       = bar["BBWidth"]   if not pd.isna(bar["BBWidth"])   else 0.05
+            atr_5roc   = bar["ATR5ROC"]   if not pd.isna(bar["ATR5ROC"])   else 0.0
 
+            # Update open trades on every bar
             self.simulator.update_trades(bar, bar_time, atr_val, rsi_slp)
 
             if not in_session: continue
 
+            # Circuit breaker check
             allowed, _ = self.simulator.is_trading_allowed()
             if not allowed: continue
 
+            # v1.5: single trade maximum (Optuna: max_concurrent=1)
             if len(self.simulator.open_trades) >= MAX_CONCURRENT_TRADES: continue
 
+            # Spread filter
             spread_pts = bar.get("Spread", 25)
             if pd.isna(spread_pts): spread_pts = 25
             if spread_pts > MAX_SPREAD_PTS: continue
 
-            h4_bars = df_h4[df_h4.index <= bar_time].tail(20)
-            h1_bars = df_h1[df_h1.index <= bar_time].tail(20)
-            if len(h4_bars)<10 or len(h1_bars)<5: continue
+            # Get H1 context (last 10 bars)
+            h1_bars = df_h1[df_h1.index <= bar_time].tail(10)
+            if len(h1_bars) < 5: continue
+            h1_last = h1_bars.iloc[-1]
 
-            h1_last     = h1_bars.iloc[-1]
-            h4_trend_up = h4_bars["Close"].iloc[-1] > h4_bars["Close"].iloc[-5]
+            # ====================================================
+            #  v1.5 SIGNAL ENGINE (ML-derived, feature-ranked)
+            # ====================================================
 
-            h1_rsi   = h1_last.get("RSI14", 50.0)
-            h1_slope = h1_last.get("EMA20slope", 0.0)
-            if pd.isna(h1_rsi):   h1_rsi   = 50.0
-            if pd.isna(h1_slope): h1_slope = 0.0
-            h1_bull  = (h1_rsi > 45) or (h1_slope > 0)
-            h1_bear  = (h1_rsi < 55) or (h1_slope < 0)
+            # --- Feature 1: H1 EMA 3-bar slope (rank 1: 17.03%) ---
+            # The most important feature. Direction of EMA acceleration.
+            h1_ema_slope3 = h1_last.get("EMA20slope3", 0.0) if hasattr(h1_last,"get") else 0.0
+            if pd.isna(h1_ema_slope3): h1_ema_slope3 = 0.0
 
-            stk_k  = bar.get("StochK", 50.0); stk_d = bar.get("StochD", 50.0)
+            # --- Feature 3: H1 EMA 5-bar slope (rank 3: 8.67%) ---
+            # Confirmation of slope direction over longer window
+            h1_ema_slope5 = h1_last.get("EMA20slope5", 0.0) if hasattr(h1_last,"get") else 0.0
+            if pd.isna(h1_ema_slope5): h1_ema_slope5 = 0.0
+
+            # --- Feature 6: ATR points minimum (rank 6: 7.74%) ---
+            # Skip if market is too quiet
+            atr_pts = atr_val / POINT
+            if atr_pts < ATR_PTS_MIN: continue
+
+            # --- Feature 8: Bollinger band width (rank 8: 5.26%) ---
+            # Skip if bands too narrow (no momentum) or too wide (late)
+            if not (BB_WIDTH_MIN <= bb_w <= BB_WIDTH_MAX): continue
+
+            # --- Feature 4: Volume vs 20-bar mean (rank 4: 8.67%) ---
+            # Require above-average volume (loose threshold from Optuna)
+            if vol_vs_mean < FILTER_VOL_VS_MEAN_MIN: continue
+
+            # --- DIRECTION DECISION ---
+            # Primary: H1 EMA slope direction (feature #1)
+            # Confirmation: EMA slope5 agrees (feature #3)
+            # Entry: StochRSI cross (oversold rank 14 / pattern)
+
+            stk_k = bar.get("StochK", 50.0)
+            stk_d = bar.get("StochD", 50.0)
             if pd.isna(stk_k): stk_k = 50.0
             if pd.isna(stk_d): stk_d = 50.0
             prev   = df_m15.iloc[i-1]
-            prev_k = prev.get("StochK", 50.0); prev_d = prev.get("StochD", 50.0)
+            prev_k = prev.get("StochK", 50.0)
+            prev_d = prev.get("StochD", 50.0)
             if pd.isna(prev_k): prev_k = 50.0
             if pd.isna(prev_d): prev_d = 50.0
 
-            bull_cross = (stk_k > stk_d and prev_k <= prev_d and stk_k < 85)
-            bear_cross = (stk_k < stk_d and prev_k >= prev_d and stk_k > 15)
+            bull_cross = (stk_k > stk_d and prev_k <= prev_d and stk_k < STOCH_BULL_CAP)
+            bear_cross = (stk_k < stk_d and prev_k >= prev_d and stk_k > STOCH_BEAR_FLOOR)
 
-            long_signal  = h4_trend_up       and h1_bull and bull_cross
-            short_signal = (not h4_trend_up) and h1_bear and bear_cross
+            # LONG signal:
+            #   H1 EMA 3-bar slope positive AND accelerating (slope5 also positive)
+            #   StochRSI bullish cross as timing trigger
+            long_signal = (h1_ema_slope3 > H1_EMA_SLOPE3_MIN_LONG and
+                           h1_ema_slope5 > 0 and
+                           bull_cross)
+
+            # SHORT signal:
+            #   H1 EMA 3-bar slope negative AND decelerating (slope5 also negative)
+            #   StochRSI bearish cross as timing trigger
+            short_signal = (h1_ema_slope3 < H1_EMA_SLOPE3_MAX_SHORT and
+                            h1_ema_slope5 < 0 and
+                            bear_cross)
+
             if not (long_signal or short_signal): continue
 
-            direction  = "LONG" if long_signal else "SHORT"
-            open_dirs  = [t.direction for t in self.simulator.open_trades]
-            if open_dirs.count(direction) >= 1: continue
+            direction = "LONG" if long_signal else "SHORT"
 
-            if vol_z < FILTER_VOL_MIN_Z: continue
+            # --- Feature 2: Price 3-bar momentum (rank 2: 8.67%) ---
+            # Confirm momentum direction matches signal
+            close_arr = df_m15["Close"].values
+            if i >= 3:
+                price_mom_3bar = (close_arr[i] - close_arr[i-3]) / (atr_val + 1e-9)
+            else:
+                price_mom_3bar = 0.0
 
-            conditions = {
-                "elliott_bias":   h4_trend_up if direction=="LONG" else not h4_trend_up,
-                "smc_structure":  h4_trend_up if direction=="LONG" else not h4_trend_up,
-                "fvg_confluence": False,
-                "h1_momentum":    h1_bull if direction=="LONG" else h1_bear,
-                "m15_bos":        bull_cross if direction=="LONG" else bear_cross,
-                "volume_confirm": vol_z > 0.5,
-            }
-            pw, raw_score, grade = self.scorer.calculate(conditions)
-            if grade == "SKIP": continue
+            if direction == "LONG"  and price_mom_3bar < -2.0: continue  # don't buy into strong selloff
+            if direction == "SHORT" and price_mom_3bar >  2.0: continue  # don't sell into strong rally
 
-            atr_pts = atr_val / POINT
-            sl_pts  = int(atr_pts * SL_ATR_MULTIPLIER)
-            sl_pts  = max(int(atr_pts*SL_ATR_MIN_MULT),
-                          min(int(atr_pts*SL_ATR_MAX_MULT), sl_pts))
-            sl_pts  = max(sl_pts, 100)
-            tp_pts  = int(sl_pts * TP_RR_RATIO)
-            entry   = bar["Close"]
+            # --- Feature 5: Price 10-bar momentum (rank 5: 8.05%) ---
+            # Confirm medium-term momentum
+            if i >= 10:
+                price_mom_10bar = (close_arr[i] - close_arr[i-10]) / (atr_val + 1e-9)
+            else:
+                price_mom_10bar = 0.0
+
+            if direction == "LONG"  and price_mom_10bar < -3.0: continue
+            if direction == "SHORT" and price_mom_10bar >  3.0: continue
+
+            # --- Feature 7: Close position in candle (rank 7: 5.57%) ---
+            # For LONG: prefer close in upper half of candle
+            # For SHORT: prefer close in lower half of candle
+            rng = bar["Range"] if bar["Range"] > 0 else 1.0
+            close_pos = (bar["Close"] - bar["Low"]) / rng
+            if direction == "LONG"  and close_pos < 0.25: continue  # closing near lows -- skip
+            if direction == "SHORT" and close_pos > 0.75: continue  # closing near highs -- skip
+
+            # --- Feature 10: ATR 5-bar ROC (rank 10: 4.02%) ---
+            # Skip if volatility is collapsing (ATR falling fast)
+            if direction == "LONG"  and atr_5roc < -0.30: continue  # volatility dying
+            if direction == "SHORT" and atr_5roc < -0.30: continue
+
+            # --- Feature 15: RSI 3-bar slope (rank 15: 2.17%) ---
+            # Mild filter -- not too extreme
+            if direction == "LONG"  and rsi_slp3 > RSI_3BAR_SLOPE_MIN_LONG:  pass  # ok
+            if direction == "SHORT" and rsi_slp3 < RSI_3BAR_SLOPE_MAX_SHORT: pass  # ok
+
+            # ====================================================
+            #  POSITION SIZING & EXECUTION
+            # ====================================================
+
+            # ATR-based SL/TP (Optuna: wider SL, better R:R)
+            sl_pts = int(atr_pts * SL_ATR_MULTIPLIER)
+            sl_pts = max(int(atr_pts*SL_ATR_MIN_MULT),
+                         min(int(atr_pts*SL_ATR_MAX_MULT), sl_pts))
+            sl_pts = max(sl_pts, 120)  # minimum 120 pts on Gold
+            tp_pts = int(sl_pts * TP_RR_RATIO)
+
+            entry = bar["Close"]
             sl = entry - sl_pts*POINT if direction=="LONG" else entry + sl_pts*POINT
             tp = entry + tp_pts*POINT if direction=="LONG" else entry - tp_pts*POINT
 
-            lot = self.simulator.calc_lot_size(sl_pts, pw, self.scorer)
+            lot = self.simulator.calc_lot_size(sl_pts)
             if lot <= 0: continue
 
+            # Day-of-week lot scaling (Optuna found near-full is optimal)
             dow = bar_time.weekday()
             if dow == 0:
                 lot = max(LOT_MIN, round(round(lot*FILTER_MONDAY_LOT/LOT_STEP)*LOT_STEP, 2))
+            elif dow == 3:
+                lot = max(LOT_MIN, round(round(lot*FILTER_THURSDAY_LOT/LOT_STEP)*LOT_STEP, 2))
 
             self.simulator.open_trade(
-                direction, entry, sl, tp, lot,
-                spread_pts, raw_score, grade, pw,
-                bar_time, params)
+                direction, entry, sl, tp, lot, spread_pts, bar_time)
 
+        # Close any remaining open trades at backtest end
         if self.simulator.open_trades:
             last_bar = df_m15.iloc[-1]
             for t in list(self.simulator.open_trades):
@@ -460,20 +581,25 @@ class BacktestRunner:
         return ResultAnalyser.analyse(self.simulator, params)
 
 if __name__ == "__main__":
-    print("="*55)
-    print("  GoldScalperBot v1.3  --  XAUUSD...")
-    print("="*55)
+    print("="*60)
+    print("  GoldScalperBot v1.5  --  XAUUSD...")
+    print("  ML-Optimized Signal Engine")
+    print("="*60)
     if not mt5.initialize():
         print(f"MT5 failed: {mt5.last_error()}"); exit(1)
     a = mt5.account_info()
     if a is None:
         print("MT5 not logged in"); mt5.shutdown(); exit(1)
     print(f"MT5 connected -- {a.login}  Balance: ${a.balance:,.2f}\n")
+
     runner = BacktestRunner()
     df_h4  = runner.loader.load("H4",  INSAMPLE_START, INSAMPLE_END)
     df_h1  = runner.loader.load("H1",  INSAMPLE_START, INSAMPLE_END)
     df_m15 = runner.loader.load("M15", INSAMPLE_START, INSAMPLE_END)
+
+    print("\nRunning v1.5 in-sample backtest...")
     result = runner._run_single(df_h4, df_h1, df_m15)
     ResultAnalyser.print_summary(result)
-    runner.logger.save_trades(result, f"v1.3_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+
+    runner.logger.save_trades(result, f"v1.5_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     mt5.shutdown(); print("Done.")
